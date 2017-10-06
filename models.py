@@ -17,7 +17,24 @@ class GreedyModel(object):
     # The new ParsedSentence should have the same tokens as the original and new dependencies constituting
     # the predicted parse.
     def parse(self, sentence):
-        raise Exception("IMPLEMENT ME")
+        state = initial_parser_state(len(sentence))
+        while not state.is_finished():
+            label_indexer = get_label_indexer()
+            prob = np.zeros((len(label_indexer)))
+            for label_idx in range(0, len(label_indexer)):
+                prob[label_idx] = score_indexed_features(extract_features(self.feature_indexer, sentence, state, label_indexer.get_object(label_idx), False), self.feature_weights)
+            decision = label_indexer.get_object(np.argmax(prob))
+            if state.stack_len() < 2:
+                state = state.shift()
+            elif decision == "L" and state.stack_two_back() != -1:
+                state = state.left_arc()
+            elif decision == "R" and not(state.stack_two_back() == -1 and state.buffer_len() != 0):
+                state = state.right_arc()
+            elif state.buffer_len() > 0:
+                state = state.shift()
+            else:
+                state = state.right_arc()
+        return ParsedSentence(sentence.tokens, state.get_dep_objs(len(sentence)))
 
 
 # Beam-search-based global parsing model. Shift/reduce decisions are still modeled with local features, but scores are
@@ -163,7 +180,53 @@ def get_label_indexer():
 
 # Returns a GreedyModel trained over the given treebank.
 def train_greedy_model(parsed_sentences):
-    raise Exception("IMPLEMENT ME")
+    # feature_cache[sentence_idx][idx_gold_sequence][decision_idx] -> features
+    feature_cache = []
+    feat_indexer = Indexer()
+    label_indexer = get_label_indexer()
+    decision_sequences = []
+    for parsed_sentence in parsed_sentences:
+        (decisions, states) = get_decision_sequence(parsed_sentence)
+        decision_sequences.append((decisions, states))
+        cache = [[] for i in range(0, len(decisions))]
+        for seq_idx in range(0, len(decisions)):
+            for label_idx in range(0, len(label_indexer)):
+                # isGold = True if label_indexer.get_object(label_idx) == decisions[seq_idx] else True
+                isGold = True
+                cache[seq_idx].append(extract_features(feat_indexer, parsed_sentence, states[seq_idx], label_indexer.get_object(label_idx), isGold))
+        feature_cache.append(cache)
+
+    # training
+    feature_weights = np.random.rand((len(feat_indexer)))
+    model = GreedyModel(feat_indexer, feature_weights)
+    epochs = 10
+    lr = 0.1
+    lamb = 0.1
+    for epoch in range(0, epochs):
+        print("Epoch : %d" % (epoch+1))
+        for sentence_idx in range(0, len(parsed_sentences)):
+            for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
+
+                gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][seq_idx])
+                max_idx = -1
+                slack = -1
+                for label_idx in range(0, len(label_indexer)):
+                    tmp = score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], model.feature_weights)
+                    if label_idx != gold_label_idx:
+                        tmp += 1
+                    if tmp > slack:
+                        max_idx = label_idx
+                        slack = tmp
+
+                gradient = Counter()
+                gradient.increment_all(feature_cache[sentence_idx][seq_idx][max_idx], 1.0)
+                gradient.increment_all(feature_cache[sentence_idx][seq_idx][gold_label_idx], -1.0)
+
+                for weight_idx in gradient.keys():
+                    model.feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx))
+                gradient = Counter()
+
+    return model
 
 
 # Returns a BeamedModel trained over the given treebank.
