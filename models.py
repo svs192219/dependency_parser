@@ -50,8 +50,35 @@ class BeamedModel(object):
     # The new ParsedSentence should have the same tokens as the original and new dependencies constituting
     # the predicted parse.
     def parse(self, sentence):
-        raise Exception("IMPLEMENT ME")
+        curr_beam = Beam(self.beam_size)
+        start_state = initial_parser_state(len(sentence))
+        curr_beam.add(start_state, 0)
+        for idx in range(0, 2*len(sentence)):
+            curr_beam = compute_successorBeam(sentence, curr_beam, self.feature_indexer, self.feature_weights)
+        final_state = curr_beam.head()
+        return ParsedSentence(sentence.tokens, final_state.get_dep_objs(len(sentence)))
 
+
+def compute_successorBeam(sentence, curr_beam, feature_indexer, feature_weights):
+    next_beam = Beam(curr_beam.size)
+    for state, score in curr_beam.get_elts_and_scores():
+        label_indexer = get_label_indexer()
+        for label_idx in range(0, len(label_indexer)):
+            action = label_indexer.get_object(label_idx)
+            if is_action_legal(state, action):
+                next_score = score + score_indexed_features(extract_features(feature_indexer, sentence, state, action, False), feature_weights)
+                state.take_action(action)
+                next_beam.add(state, next_score)
+    return next_beam
+
+def is_action_legal(state, action):
+    if action == "S":
+        return state.buffer_len() > 0
+    elif action == "L":
+        return state.stack_len() >= 2 and state.stack_two_back() != -1
+    elif action == "R":
+        return state.stack_len() >= 2 and not(state.stack_two_back() == -1 and state.buffer_len() != 0)
+    return False
 
 # Stores state of a shift-reduce parser, namely the stack, buffer, and the set of dependencies that have
 # already been assigned. Supports various accessors as well as the ability to create new ParserStates
@@ -182,7 +209,7 @@ def get_label_indexer():
 def train_greedy_model(parsed_sentences):
     # feature_cache[sentence_idx][idx_gold_sequence][decision_idx] -> features
     feature_cache = []
-    feat_indexer = Indexer()
+    feature_indexer = Indexer()
     label_indexer = get_label_indexer()
     decision_sequences = []
     for parsed_sentence in parsed_sentences:
@@ -193,13 +220,13 @@ def train_greedy_model(parsed_sentences):
             for label_idx in range(0, len(label_indexer)):
                 # isGold = True if label_indexer.get_object(label_idx) == decisions[seq_idx] else True
                 isGold = True
-                cache[seq_idx].append(extract_features(feat_indexer, parsed_sentence, states[seq_idx], label_indexer.get_object(label_idx), isGold))
+                cache[seq_idx].append(extract_features(feature_indexer, parsed_sentence, states[seq_idx], label_indexer.get_object(label_idx), isGold))
         feature_cache.append(cache)
 
     # training
-    feature_weights = np.random.rand((len(feat_indexer)))
-    model = GreedyModel(feat_indexer, feature_weights)
-    epochs = 10
+    feature_weights = np.random.rand((len(feature_indexer)))
+    model = GreedyModel(feature_indexer, feature_weights)
+    epochs = 1
     lr = 0.1
     lamb = 0.1
     for epoch in range(0, epochs):
@@ -231,7 +258,77 @@ def train_greedy_model(parsed_sentences):
 
 # Returns a BeamedModel trained over the given treebank.
 def train_beamed_model(parsed_sentences):
-    raise Exception("IMPLEMENT ME")
+    feature_cache = []
+    feature_indexer = Indexer()
+    label_indexer = get_label_indexer()
+    decision_sequences = []
+    for parsed_sentence in parsed_sentences:
+        (decisions, states) = get_decision_sequence(parsed_sentence)
+        decision_sequences.append((decisions, states))
+        cache = [[] for i in range(0, len(decisions))]
+        for seq_idx in range(0, len(decisions)):
+            for label_idx in range(0, len(label_indexer)):
+                # isGold = True if label_indexer.get_object(label_idx) == decisions[seq_idx] else True
+                isGold = True
+                cache[seq_idx].append(extract_features(feature_indexer, parsed_sentence, states[seq_idx], label_indexer.get_object(label_idx), isGold))
+        feature_cache.append(cache)
+
+    # training
+    feature_weights = np.random.rand((len(feature_indexer)))
+    model = BeamedModel(feature_indexer, feature_weights, 2)
+    epochs = 1
+    lr = 0.1
+    lamb = 0.1
+    beam_size = 2
+    for epoch in range(0, epochs):
+        print("Epoch : %d" % (epoch+1))
+        for sentence_idx in range(0, len(parsed_sentences)):
+            # for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
+            sentence = parsed_sentences[sentence_idx]
+            start_state = initial_parser_state(len(sentence))
+            curr_beam = Beam(beam_size)
+            curr_beam.add((start_state, []), 0)
+            gradient = Counter()
+            gold_feats = []
+            max_feats = []
+            early = False
+            for idx in range(0, 2*len(sentence)):
+                next_beam = Beam(curr_beam.size)
+                for (state, feats), score in curr_beam.get_elts_and_scores():
+                    label_indexer = get_label_indexer()
+                    for label_idx in range(0, len(label_indexer)):
+                        action = label_indexer.get_object(label_idx)
+                        if is_action_legal(state, action):
+                            tmp = feacture_cache[sentence_idx][idx][label_idx]
+                            next_score = score + score_indexed_features(tmp, model.feature_weights)
+                            feats.append(tmp)
+                            state.take_action(action)
+                            next_beam.add((state, feats), next_score)
+                gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][idx])
+                gold_feats.append(feature_cache[sentence_idx][idx][gold_label_idx])
+
+                # Early update
+                if decision_sequences[sentence_idx][1][idx] not in next_beam.get_elts():
+                    max_feats = next_beam.head()[1]
+                    early = True
+                    break
+                curr_beam = next_beam
+
+            if not early:
+                max_feats = curr_beam.head()[1]
+
+            # apply gradient
+            gradient = Counter()
+            for feats in gold_feats:
+                gradient.increment_all(feats, 1.0)
+            for feats in max_feats:
+                gradient.increment_all(feats, -1.0)
+
+            for weight_idx in gradient.keys():
+                model.feature_weights[weight_idx] += (lr * gradient.get_count(weight_idx))
+            gradient = Counter()
+
+    return model
 
 
 # Extract features for the given decision in the given parser state. Features look at the top of the
