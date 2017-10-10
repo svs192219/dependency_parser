@@ -53,7 +53,7 @@ class BeamedModel(object):
         curr_beam = Beam(self.beam_size)
         start_state = initial_parser_state(len(sentence))
         curr_beam.add(start_state, 0)
-        for idx in range(0, 2*len(sentence)):
+        for _ in range(0, 2*len(sentence)):
             curr_beam = compute_successorBeam(sentence, curr_beam, self.feature_indexer, self.feature_weights)
         final_state = curr_beam.head()
         return ParsedSentence(sentence.tokens, final_state.get_dep_objs(len(sentence)))
@@ -67,8 +67,7 @@ def compute_successorBeam(sentence, curr_beam, feature_indexer, feature_weights)
             action = label_indexer.get_object(label_idx)
             if is_action_legal(state, action):
                 next_score = score + score_indexed_features(extract_features(feature_indexer, sentence, state, action, False), feature_weights)
-                state.take_action(action)
-                next_beam.add(state, next_score)
+                next_beam.add(state.take_action(action), next_score)
     return next_beam
 
 def is_action_legal(state, action):
@@ -226,11 +225,12 @@ def train_greedy_model(parsed_sentences):
     # training
     feature_weights = np.random.rand((len(feature_indexer)))
     model = GreedyModel(feature_indexer, feature_weights)
-    epochs = 1
-    lr = 0.1
+    epochs = 15
+    lr = 0.01
     lamb = 0.1
     for epoch in range(0, epochs):
         print("Epoch : %d" % (epoch+1))
+        # gradient = Counter() 
         for sentence_idx in range(0, len(parsed_sentences)):
             for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
 
@@ -250,7 +250,7 @@ def train_greedy_model(parsed_sentences):
                 gradient.increment_all(feature_cache[sentence_idx][seq_idx][gold_label_idx], -1.0)
 
                 for weight_idx in gradient.keys():
-                    model.feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx))
+                    model.feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx)) 
                 gradient = Counter()
 
     return model
@@ -299,11 +299,10 @@ def train_beamed_model(parsed_sentences):
                     for label_idx in range(0, len(label_indexer)):
                         action = label_indexer.get_object(label_idx)
                         if is_action_legal(state, action):
-                            tmp = feacture_cache[sentence_idx][idx][label_idx]
+                            tmp = feature_cache[sentence_idx][idx][label_idx]
                             next_score = score + score_indexed_features(tmp, model.feature_weights)
                             feats.append(tmp)
-                            state.take_action(action)
-                            next_beam.add((state, feats), next_score)
+                            next_beam.add((state.take_action(action), feats), next_score)
                 gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][idx])
                 gold_feats.append(feature_cache[sentence_idx][idx][gold_label_idx])
 
