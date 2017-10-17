@@ -1,5 +1,5 @@
 # treedata.py
-
+from collections import defaultdict
 
 # Abstraction to bundle words with POS and chunks for featurization
 # pos = part-of-speech, cpos = coarse part-of-speech
@@ -32,6 +32,10 @@ class ParsedSentence:
     def __init__(self, tokens, deps=None):
         self.tokens = tokens
         self.deps = deps
+        self.heads = defaultdict(list)
+        for i in range(0, len(self.deps)):
+            head = self.deps[i].parent_idx
+            self.heads[head].append(i)
 
     def __repr__(self):
         return repr([repr(tok) for tok in self.tokens]) + "\n" + repr([repr(dep) for dep in self.deps])

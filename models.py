@@ -6,6 +6,7 @@ from treedata import *
 import numpy as np
 
 
+
 # Greedy parsing model. This model treats shift/reduce decisions as a multiclass classification problem.
 class GreedyModel(object):
     def __init__(self, feature_indexer, feature_weights):
@@ -35,6 +36,55 @@ class GreedyModel(object):
             else:
                 state = state.right_arc()
         return ParsedSentence(sentence.tokens, state.get_dep_objs(len(sentence)))
+
+class EagerGreedyModel(object):
+    def __init__(self, feature_indexer, feature_weights):
+        self.feature_indexer = feature_indexer
+        self.feature_weights = feature_weights
+        # TODO: Modify or add arguments as necessary
+
+    # Given a ParsedSentence, returns a new ParsedSentence with predicted dependency information.
+    # The new ParsedSentence should have the same tokens as the original and new dependencies constituting
+    # the predicted parse.
+    def parse(self, sentence):
+        state = initial_parser_state(len(sentence))
+        while not state.is_eager_finished():
+            label_indexer = get_eager_label_indexer()
+            prob = np.zeros((len(label_indexer)))
+            for label_idx in range(0, len(label_indexer)):
+                prob[label_idx] = score_indexed_features(extract_features(self.feature_indexer, sentence, state, label_indexer.get_object(label_idx), False), self.feature_weights)
+            decision = label_indexer.get_object(np.argmax(prob))
+            legal_transitions = self.legal(state)
+            # print('State : ', state)
+            # print('Legal : ', legal_transitions)
+            # print('Decision : ', decision)
+            if decision in legal_transitions:
+                # print('Taking action : ', decision)
+                state = state.take_eager_action(decision)
+            else:
+                # print('Taking action : ', legal_transitions[0])
+                state = state.take_eager_action(legal_transitions[0])
+        return ParsedSentence(sentence.tokens, state.get_eager_dep_objs(len(sentence)))
+
+
+    def legal(self, state):
+        legal_transitions = ["LA", "RA", "RE", "SH"]
+
+        if state.buffer_len() == 0:
+            return []
+
+        stack_top = state.stack_head()
+        if stack_top == -1:
+            if "RE" in legal_transitions: legal_transitions.remove("RE")
+            if "LA" in legal_transitions: legal_transitions.remove("LA")
+
+        if stack_top != -1:
+            if stack_top not in state.deps.keys():
+                if "RE" in legal_transitions: legal_transitions.remove("RE")
+            else:
+                if "LA" in legal_transitions: legal_transitions.remove("LA")
+        return legal_transitions
+
 
 
 # Beam-search-based global parsing model. Shift/reduce decisions are still modeled with local features, but scores are
@@ -118,6 +168,9 @@ class ParserState(object):
     def is_finished(self):
         return len(self.buffer) == 0 and len(self.stack) == 1
 
+    def is_eager_finished(self):
+        return len(self.buffer) == 0
+
     def buffer_head(self):
         return self.get_buffer_word_idx(0)
 
@@ -157,6 +210,16 @@ class ParserState(object):
         else:
             raise Exception("No implementation for action " + action)
 
+    def take_eager_action(self, action):
+        if action == "LA":
+            return self.eager_left()
+        elif action == "RA":
+            return self.eager_right()
+        elif action == "RE":
+            return self.eager_reduce()
+        else:
+            return self.eager_shift()
+
     # Returns a new ParserState that is the result of applying left arc to the current state. May crash if the
     # preconditions for left arc aren't met.
     def left_arc(self):
@@ -181,11 +244,43 @@ class ParserState(object):
         new_stack.append(self.buffer_head())
         return ParserState(new_stack, self.buffer[1:], self.deps)
 
+    def eager_left(self):
+        new_deps = dict(self.deps)
+        new_deps.update({self.stack_head(): self.buffer_head()})
+        new_stack = list(self.stack[0:-1])
+        return ParserState(new_stack, self.buffer, new_deps)
+
+    def eager_right(self):
+        new_deps = dict(self.deps)
+        new_deps.update({self.buffer_head(): self.stack_head()})
+        new_stack = list(self.stack)
+        new_stack.append(self.buffer_head())
+        return ParserState(new_stack, self.buffer[1:], new_deps)
+
+    def eager_reduce(self):
+        new_deps = dict(self.deps)
+        return ParserState(self.stack[0:-1], self.buffer, new_deps)
+
+    def eager_shift(self):
+        new_stack = list(self.stack)
+        new_stack.append(self.buffer_head())
+        return ParserState(new_stack, self.buffer[1:], self.deps)
+
+
     # Return the Dependency objects corresponding to the dependencies added so far to this ParserState
     def get_dep_objs(self, sent_len):
         dep_objs = []
         for i in xrange(0, sent_len):
             dep_objs.append(Dependency(self.deps[i], "?"))
+        return dep_objs
+
+    def get_eager_dep_objs(self, sent_len):
+        dep_objs = []
+        for i in xrange(0, sent_len):
+            if i not in self.deps:
+                dep_objs.append(Dependency(-1, "?"))
+            else:
+                dep_objs.append(Dependency(self.deps[i], "?"))
         return dep_objs
 
 
@@ -202,6 +297,14 @@ def get_label_indexer():
     label_indexer.get_index("L")
     label_indexer.get_index("R")
     return label_indexer
+
+def get_eager_label_indexer():
+    label_indexer = Indexer()
+    label_indexer.get_index("LA")
+    label_indexer.get_index("RA")
+    label_indexer.get_index("RE")
+    label_indexer.get_index("SH")
+    return label_indexer    
 
 
 # Returns a GreedyModel trained over the given treebank.
@@ -253,6 +356,51 @@ def train_greedy_model(parsed_sentences):
 
     return model
 
+def train_eager_greedy_model(parsed_sentences):
+    # feature_cache[sentence_idx][idx_gold_sequence][decision_idx] -> features
+    feature_cache = []
+    feature_indexer = Indexer()
+    label_indexer = get_eager_label_indexer()
+    decision_sequences = []
+    for parsed_sentence in parsed_sentences:
+        (decisions, states) = get_eager_decision_sequence(parsed_sentence)
+        decision_sequences.append((decisions, states))
+        cache = [[] for i in range(0, len(decisions))]
+        for seq_idx in range(0, len(decisions)):
+            for label_idx in range(0, len(label_indexer)):
+                cache[seq_idx].append(extract_features(feature_indexer, parsed_sentence, states[seq_idx], label_indexer.get_object(label_idx), True))
+        feature_cache.append(cache)
+
+    # training
+    feature_weights = np.random.rand((len(feature_indexer)))
+    model = EagerGreedyModel(feature_indexer, feature_weights)
+    epochs = 10
+    lr = 0.01
+    for epoch in range(0, epochs):
+        print("Epoch : %d" % (epoch+1))
+        for sentence_idx in range(0, len(parsed_sentences)):
+            for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
+
+                gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][seq_idx])
+                max_idx = -1
+                slack = -1
+                for label_idx in range(0, len(label_indexer)):
+                    tmp = score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], model.feature_weights)
+                    if label_idx != gold_label_idx:
+                        tmp += 1
+                    if tmp > slack:
+                        max_idx = label_idx
+                        slack = tmp
+
+                gradient = Counter()
+                gradient.increment_all(feature_cache[sentence_idx][seq_idx][max_idx], 1.0)
+                gradient.increment_all(feature_cache[sentence_idx][seq_idx][gold_label_idx], -1.0)
+
+                for weight_idx in gradient.keys():
+                    model.feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx)) 
+                gradient = Counter()
+
+    return model
 
 # Returns a BeamedModel trained over the given treebank.
 def train_beamed_model(parsed_sentences):
@@ -426,3 +574,50 @@ def get_decision_sequence(parsed_sentence):
             state = state.shift()
     states.append(state)
     return (decisions, states)
+
+
+def get_eager_decision_sequence(parsed_sentence):
+    decisions = []
+    states = []
+    state = initial_parser_state(len(parsed_sentence))
+    while not state.is_eager_finished():
+        if not state.is_legal():
+            raise Exception(repr(decisions) + " " + repr(state))
+        
+        if state.buffer_len() == 0:
+            result = "SH"
+        else:
+            stack_top = state.stack_head()
+            buffer_head = state.buffer_head()
+            result = ""
+
+            # left arc
+            if stack_top in parsed_sentence.heads[buffer_head]:
+                result = "LA"
+            elif buffer_head in parsed_sentence.heads[stack_top]:
+                result = "RA"
+            else:
+                reducePossible = False
+                for dep in parsed_sentence.heads[buffer_head]:
+                    if dep < stack_top:
+                        reducePossible = True
+                if parsed_sentence.get_parent_idx(buffer_head) < stack_top:
+                    reducePossible = True
+                if reducePossible:
+                    result = "RE"
+                else:
+                    result = "SH"
+
+        decisions.append(result)
+        states.append(state)
+        if result == "LA":
+            state = state.eager_left()
+        elif result == "RA":
+            state = state.eager_right()
+        elif result == "RE":
+            state = state.eager_reduce()
+        else:
+            state = state.eager_shift()
+    states.append(state)
+    return (decisions, states)
+
