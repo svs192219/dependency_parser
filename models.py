@@ -4,7 +4,7 @@ from utils import *
 from adagrad_trainer import *
 from treedata import *
 import numpy as np
-
+import random
 
 
 # Greedy parsing model. This model treats shift/reduce decisions as a multiclass classification problem.
@@ -54,7 +54,7 @@ class EagerGreedyModel(object):
             for label_idx in range(0, len(label_indexer)):
                 prob[label_idx] = score_indexed_features(extract_features(self.feature_indexer, sentence, state, label_indexer.get_object(label_idx), False), self.feature_weights)
             decision = label_indexer.get_object(np.argmax(prob))
-            legal_transitions = self.legal(state)
+            legal_transitions = legal(state)
             # print('State : ', state)
             # print('Legal : ', legal_transitions)
             # print('Decision : ', decision)
@@ -67,23 +67,23 @@ class EagerGreedyModel(object):
         return ParsedSentence(sentence.tokens, state.get_eager_dep_objs(len(sentence)))
 
 
-    def legal(self, state):
-        legal_transitions = ["LA", "RA", "RE", "SH"]
+def legal(state):
+    legal_transitions = ["LA", "RA", "RE", "SH"]
 
-        if state.buffer_len() == 0:
-            return []
+    if state.buffer_len() == 0:
+        return []
 
-        stack_top = state.stack_head()
-        if stack_top == -1:
+    stack_top = state.stack_head()
+    if stack_top == -1:
+        if "RE" in legal_transitions: legal_transitions.remove("RE")
+        if "LA" in legal_transitions: legal_transitions.remove("LA")
+
+    if stack_top != -1:
+        if stack_top not in state.deps.keys():
             if "RE" in legal_transitions: legal_transitions.remove("RE")
+        else:
             if "LA" in legal_transitions: legal_transitions.remove("LA")
-
-        if stack_top != -1:
-            if stack_top not in state.deps.keys():
-                if "RE" in legal_transitions: legal_transitions.remove("RE")
-            else:
-                if "LA" in legal_transitions: legal_transitions.remove("LA")
-        return legal_transitions
+    return legal_transitions
 
 
 
@@ -356,7 +356,83 @@ def train_greedy_model(parsed_sentences):
 
     return model
 
-def train_eager_greedy_model(parsed_sentences):
+def zero_cost_left(state, parsed_sentence):
+    if state.stack_len() == 0 or state.buffer_len() == 0:
+        return False
+    stack_top = state.stack_head()
+    
+    for elem in state.buffer[1:]:
+        if parsed_sentence.get_parent_idx(elem) == stack_top:
+            return False
+        if stack_top != -1 and parsed_sentence.get_parent_idx(stack_top) == elem:
+            return False
+
+    return True
+
+def zero_cost_right(state, parsed_sentence):
+    if state.stack_len() == 0 or state.buffer_len() == 0:
+        return False
+    buffer_head = state.buffer_head()
+
+    for elem in state.stack[0:-1]:
+        if elem != -1 and  parsed_sentence.get_parent_idx(elem) == buffer_head:
+            return False
+        if parsed_sentence.get_parent_idx(buffer_head) == elem:
+            return False
+
+    for elem in state.buffer[1:]:
+        if parsed_sentence.get_parent_idx(buffer_head) == elem:
+            return False
+
+    return True
+
+def zero_cost_reduce(state, parsed_sentence):
+    if state.buffer_len() < 1:
+        return False
+    stack_top = state.stack_head()
+    if stack_top == -1:
+        return False
+    for elem in state.buffer:
+        if parsed_sentence.get_parent_idx(elem) == stack_top:
+            return False
+    return True
+
+def zero_cost_shift(state, parsed_sentence):
+    if state.buffer_len() < 1:
+        return False
+    buffer_head = state.buffer_head()
+    for elem in state.stack:
+        if elem != -1 and parsed_sentence.get_parent_idx(elem) == buffer_head:
+            return False
+        if parsed_sentence.get_parent_idx(buffer_head) == elem:
+            return False
+    return True
+
+def zero_cost_transitions(state, parsed_sentence, legal_transitions):
+    zero_cost = []
+    if zero_cost_left(state, parsed_sentence) and "LA" in legal_transitions:
+        zero_cost.append("LA")
+    elif zero_cost_right(state, parsed_sentence) and "RA" in legal_transitions:
+        zero_cost.append("RA")
+    elif zero_cost_reduce(state, parsed_sentence) and "RE" in legal_transitions:
+        zero_cost.append("RE")
+    elif zero_cost_shift(state, parsed_sentence) and "SH" in legal_transitions:
+        zero_cost.append("SH")
+    return zero_cost
+
+def choose_next_amb(epoch, pred_t, zero_cost_t):
+    if pred_t in zero_cost_t:
+        return pred_t
+    else:
+        return random.choice(zero_cost_t)
+
+def choose_next_exp(epoch, pred_t, zero_cost_t):
+    if epoch > 1 and np.random.rand() > 0.1:
+        return pred_t
+    else:
+        return choose_next_amb(epoch, pred_t, zero_cost_t)
+
+def train_eager_greedy_model(parsed_sentences, useDynamic=False):
     # feature_cache[sentence_idx][idx_gold_sequence][decision_idx] -> features
     feature_cache = []
     feature_indexer = Indexer()
@@ -372,34 +448,73 @@ def train_eager_greedy_model(parsed_sentences):
         feature_cache.append(cache)
 
     # training
-    feature_weights = np.random.rand((len(feature_indexer)))
-    model = EagerGreedyModel(feature_indexer, feature_weights)
+    feature_weights = np.zeros((len(feature_indexer)))
+    avg_feature_weights = np.zeros((len(feature_indexer)))
     epochs = 10
-    lr = 0.01
+    lr = 1
+    step = epochs * len(parsed_sentences)
+    total_iters = step
+
     for epoch in range(0, epochs):
         print("Epoch : %d" % (epoch+1))
         for sentence_idx in range(0, len(parsed_sentences)):
-            for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
+            if useDynamic:
+                state = initial_parser_state(len(parsed_sentences[sentence_idx]))
+                seq_idx = 0
+                while not state.is_eager_finished():
+                    legal_t = legal(state)
+                    legal_indices = []
+                    for t in legal_t:
+                        legal_indices.append(label_indexer.index_of(t))
+                    zero_cost_t = zero_cost_transitions(state, parsed_sentences[sentence_idx], legal_t)
+                    zero_cost_indices = []
+                    for t in zero_cost_t:
+                        zero_cost_indices.append(label_indexer.index_of(t))
+                    pred_scores = []
+                    for label_idx in range(0, len(label_indexer)):
+                        pred_scores.append(score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], feature_weights))
 
-                gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][seq_idx])
-                max_idx = -1
-                slack = -1
-                for label_idx in range(0, len(label_indexer)):
-                    tmp = score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], model.feature_weights)
-                    if label_idx != gold_label_idx:
-                        tmp += 1
-                    if tmp > slack:
-                        max_idx = label_idx
-                        slack = tmp
+                    pred_t_idx = max(legal_indices, key=lambda p:pred_scores[p])
+                    if len(zero_cost_t) == 0:
+                        state = state.take_eager_action(label_indexer.get_object(pred_t_idx))
+                        continue
+                    zero_t_idx = max(zero_cost_indices, key=lambda p:pred_scores[p])
 
-                gradient = Counter()
-                gradient.increment_all(feature_cache[sentence_idx][seq_idx][max_idx], 1.0)
-                gradient.increment_all(feature_cache[sentence_idx][seq_idx][gold_label_idx], -1.0)
+                    if pred_t_idx != zero_t_idx:
+                        gradient = Counter()
+                        gradient.increment_all(feature_cache[sentence_idx][seq_idx][pred_t_idx], 1.0)
+                        gradient.increment_all(feature_cache[sentence_idx][seq_idx][zero_t_idx], -1.0)
 
-                for weight_idx in gradient.keys():
-                    model.feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx)) 
-                gradient = Counter()
+                        for weight_idx in gradient.keys():
+                            feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx))
+                            avg_feature_weights[weight_idx] -= (step * lr * gradient.get_count(weight_idx))/total_iters
+                        gradient = Counter()
 
+                    action_idx = choose_next_amb(epoch, pred_t_idx, zero_cost_indices)
+                    state = state.take_eager_action(label_indexer.get_object(action_idx))
+
+            else:
+                for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
+                    gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][seq_idx])
+                    max_idx = -1
+                    slack = -1
+                    for label_idx in range(0, len(label_indexer)):
+                        tmp = score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], feature_weights)
+                        if tmp > slack:
+                            max_idx = label_idx
+                            slack = tmp
+
+                    gradient = Counter()
+                    gradient.increment_all(feature_cache[sentence_idx][seq_idx][max_idx], 1.0)
+                    gradient.increment_all(feature_cache[sentence_idx][seq_idx][gold_label_idx], -1.0)
+
+                    for weight_idx in gradient.keys():
+                        feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx))
+                        avg_feature_weights[weight_idx] -= (step * lr * gradient.get_count(weight_idx))/total_iters
+                    gradient = Counter()
+            step -= 1
+
+    model = EagerGreedyModel(feature_indexer, feature_weights)
     return model
 
 # Returns a BeamedModel trained over the given treebank.
@@ -480,7 +595,7 @@ def train_beamed_model(parsed_sentences):
                 feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx))
                 avg_feature_weights[weight_idx] -= (step * lr * gradient.get_count(weight_idx))/total_iters
             gradient = Counter()
-        step -= 1
+            step -= 1
 
     model = BeamedModel(feature_indexer, feature_weights, beam_size=beam_size)
     return model

@@ -66,6 +66,15 @@ if __name__ == '__main__':
             test = read_data("data/test.conllx.blind")
             test_decoded = [trained_model.parse(test_ex) for test_ex in test]
             print_output(test_decoded, "test.conllx.out")
+    elif system_to_run == "EAGER_DYNAMIC":
+        trained_model = train_eager_greedy_model(train, useDynamic=True)
+        print "Parsing dev"
+        parsed_dev = [trained_model.parse(sent) for sent in dev]
+        if run_on_test:
+            print "Parsing test"
+            test = read_data("data/test.conllx.blind")
+            test_decoded = [trained_model.parse(test_ex) for test_ex in test]
+            print_output(test_decoded, "test.conllx.out")
     else:
         raise Exception("Pass in either TEST_TRANSITIONS, GREEDY, or BEAM to run the appropriate system")
     print_evaluation(dev, parsed_dev)
