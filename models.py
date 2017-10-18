@@ -37,36 +37,6 @@ class GreedyModel(object):
                 state = state.right_arc()
         return ParsedSentence(sentence.tokens, state.get_dep_objs(len(sentence)))
 
-class EagerGreedyModel(object):
-    def __init__(self, feature_indexer, feature_weights):
-        self.feature_indexer = feature_indexer
-        self.feature_weights = feature_weights
-        # TODO: Modify or add arguments as necessary
-
-    # Given a ParsedSentence, returns a new ParsedSentence with predicted dependency information.
-    # The new ParsedSentence should have the same tokens as the original and new dependencies constituting
-    # the predicted parse.
-    def parse(self, sentence):
-        state = initial_parser_state(len(sentence))
-        while not state.is_eager_finished():
-            label_indexer = get_eager_label_indexer()
-            prob = np.zeros((len(label_indexer)))
-            for label_idx in range(0, len(label_indexer)):
-                prob[label_idx] = score_indexed_features(extract_features(self.feature_indexer, sentence, state, label_indexer.get_object(label_idx), False), self.feature_weights)
-            decision = label_indexer.get_object(np.argmax(prob))
-            legal_transitions = legal(state)
-            # print('State : ', state)
-            # print('Legal : ', legal_transitions)
-            # print('Decision : ', decision)
-            if decision in legal_transitions:
-                # print('Taking action : ', decision)
-                state = state.take_eager_action(decision)
-            else:
-                # print('Taking action : ', legal_transitions[0])
-                state = state.take_eager_action(legal_transitions[0])
-        return ParsedSentence(sentence.tokens, state.get_eager_dep_objs(len(sentence)))
-
-
 def legal(state):
     legal_transitions = ["LA", "RA", "RE", "SH"]
 
@@ -432,89 +402,92 @@ def choose_next_exp(epoch, pred_t, zero_cost_t):
     else:
         return choose_next_amb(epoch, pred_t, zero_cost_t)
 
-def train_eager_greedy_model(parsed_sentences, useDynamic=False):
-    # feature_cache[sentence_idx][idx_gold_sequence][decision_idx] -> features
+class EagerGreedyModel(object):
+    def __init__(self, classifier):
+        self.classifier = classifier
+        self.train_tick = 0
+        self.train_last_tick = defaultdict(lambda: 0)
+        self.train_totals = defaultdict(lambda: 0)
+
+    def update(self, pred, truth, features):
+        def update_feature_label(label, f, value):
+            w = 0
+            try:
+                w = self.classifier.weights[f][label]
+            except KeyError:
+                if f not in self.classifier.weights:
+                    self.classifier.weights[f] = defaultdict(lambda: 0)
+
+            delta = self.train_tick - self.train_last_tick[(f, label)]
+            self.train_totals[(f, label)] += delta * w
+            self.classifier.weights[f][label] += value
+            self.train_last_tick[(f, label)] = self.train_tick
+
+        self.train_tick += 1
+        for f, _ in features.items():
+            update_feature_label(truth, f, 1.0)
+            update_feature_label(pred, f, -1.0)
+
+
+    def avg_weights(self):
+        for f in self.classifier.weights:
+            for l in self.classifier.weights[f]:
+                total = self.train_totals[(f, l)]
+                delta = self.train_tick - self.train_last_tick[(f, l)]
+                total += delta * self.classifier.weights[f][l]
+                avg = round(total / float(self.train_tick))
+                if avg:
+                    self.classifier.weights[f][l] = avg
+
+    # Given a ParsedSentence, returns a new ParsedSentence with predicted dependency information.
+    # The new ParsedSentence should have the same tokens as the original and new dependencies constituting
+    # the predicted parse.
+    def parse(self, sentence):
+        state = initial_parser_state(len(sentence))
+        while not state.is_eager_finished():
+            label_indexer = get_eager_label_indexer()
+            feats = extract_feature_dict(sentence, state)
+            pred_scores = self.classifier.score(feats)
+            legal_transitions = legal(state)
+            legal_indices = []
+            for t in legal_transitions:
+                legal_indices.append(label_indexer.index_of(t))
+            decision_idx = max(legal_indices, key=lambda p:pred_scores[p])
+            decision = label_indexer.get_object(decision_idx)
+            state = state.take_eager_action(decision)
+        return ParsedSentence(sentence.tokens, state.get_eager_dep_objs(len(sentence)))
+
+def train_eager_greedy_model(parsed_sentences):
     feature_cache = []
-    feature_indexer = Indexer()
     label_indexer = get_eager_label_indexer()
     decision_sequences = []
+    model = EagerGreedyModel(Classifier({}, [0, 1, 2, 3]))
     for parsed_sentence in parsed_sentences:
         (decisions, states) = get_eager_decision_sequence(parsed_sentence)
         decision_sequences.append((decisions, states))
-        cache = [[] for i in range(0, len(decisions))]
+        cache = []
         for seq_idx in range(0, len(decisions)):
-            for label_idx in range(0, len(label_indexer)):
-                cache[seq_idx].append(extract_features(feature_indexer, parsed_sentence, states[seq_idx], label_indexer.get_object(label_idx), True))
+            feats = extract_feature_dict(parsed_sentence, states[seq_idx])
+            cache.append(feats)
+            model.classifier.add_weights(feats)
         feature_cache.append(cache)
 
     # training
-    feature_weights = np.zeros((len(feature_indexer)))
-    avg_feature_weights = np.zeros((len(feature_indexer)))
     epochs = 10
-    lr = 1
-    step = epochs * len(parsed_sentences)
-    total_iters = step
-
     for epoch in range(0, epochs):
         print("Epoch : %d" % (epoch+1))
         for sentence_idx in range(0, len(parsed_sentences)):
-            if useDynamic:
-                state = initial_parser_state(len(parsed_sentences[sentence_idx]))
-                seq_idx = 0
-                while not state.is_eager_finished():
-                    legal_t = legal(state)
-                    legal_indices = []
-                    for t in legal_t:
-                        legal_indices.append(label_indexer.index_of(t))
-                    zero_cost_t = zero_cost_transitions(state, parsed_sentences[sentence_idx], legal_t)
-                    zero_cost_indices = []
-                    for t in zero_cost_t:
-                        zero_cost_indices.append(label_indexer.index_of(t))
-                    pred_scores = []
-                    for label_idx in range(0, len(label_indexer)):
-                        pred_scores.append(score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], feature_weights))
+            for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
+                gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][seq_idx])
+                pred_scores = model.classifier.score(feature_cache[sentence_idx][seq_idx])
+                legal_t = legal(decision_sequences[sentence_idx][1][seq_idx])
+                legal_indices = []
+                for t in legal_t:
+                    legal_indices.append(label_indexer.index_of(t))
+                pred_t_idx = max(legal_indices, key=lambda p:pred_scores[p])
 
-                    pred_t_idx = max(legal_indices, key=lambda p:pred_scores[p])
-                    if len(zero_cost_t) == 0:
-                        state = state.take_eager_action(label_indexer.get_object(pred_t_idx))
-                        continue
-                    zero_t_idx = max(zero_cost_indices, key=lambda p:pred_scores[p])
-
-                    if pred_t_idx != zero_t_idx:
-                        gradient = Counter()
-                        gradient.increment_all(feature_cache[sentence_idx][seq_idx][pred_t_idx], 1.0)
-                        gradient.increment_all(feature_cache[sentence_idx][seq_idx][zero_t_idx], -1.0)
-
-                        for weight_idx in gradient.keys():
-                            feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx))
-                            avg_feature_weights[weight_idx] -= (step * lr * gradient.get_count(weight_idx))/total_iters
-                        gradient = Counter()
-
-                    action_idx = choose_next_amb(epoch, pred_t_idx, zero_cost_indices)
-                    state = state.take_eager_action(label_indexer.get_object(action_idx))
-
-            else:
-                for seq_idx in range(0, len(decision_sequences[sentence_idx][0])):
-                    gold_label_idx = label_indexer.get_index(decision_sequences[sentence_idx][0][seq_idx])
-                    max_idx = -1
-                    slack = -1
-                    for label_idx in range(0, len(label_indexer)):
-                        tmp = score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], feature_weights)
-                        if tmp > slack:
-                            max_idx = label_idx
-                            slack = tmp
-
-                    gradient = Counter()
-                    gradient.increment_all(feature_cache[sentence_idx][seq_idx][max_idx], 1.0)
-                    gradient.increment_all(feature_cache[sentence_idx][seq_idx][gold_label_idx], -1.0)
-
-                    for weight_idx in gradient.keys():
-                        feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx))
-                        avg_feature_weights[weight_idx] -= (step * lr * gradient.get_count(weight_idx))/total_iters
-                    gradient = Counter()
-            step -= 1
-
-    model = EagerGreedyModel(feature_indexer, feature_weights)
+                if gold_label_idx != pred_t_idx:
+                    model.update(pred_t_idx, gold_label_idx, feature_cache[sentence_idx][seq_idx])
     return model
 
 class EagerDynamicModel(object):
@@ -589,6 +562,11 @@ class Classifier(object):
             for label, weight in self.weights[feat].items():
                 scores[label] += weight * value
         return scores
+
+    def add_weights(self, features):
+        for feat, _ in features.items():
+            if feat not in self.weights:
+                self.weights[feat] = defaultdict(lambda: 0)
 
 
 def train_eager_dynamic_model(parsed_sentences):
