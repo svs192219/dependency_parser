@@ -517,6 +517,119 @@ def train_eager_greedy_model(parsed_sentences, useDynamic=False):
     model = EagerGreedyModel(feature_indexer, feature_weights)
     return model
 
+class EagerDynamicModel(object):
+    def __init__(self, classifier):
+        self.classifier = classifier
+        self.train_tick = 0
+        self.train_last_tick = defaultdict(lambda: 0)
+        self.train_totals = defaultdict(lambda: 0)
+
+    def update(self, pred, truth, features):
+        def update_feature_label(label, f, value):
+            w = 0
+            try:
+                w = self.classifier.weights[f][label]
+            except KeyError:
+                if f not in self.classifier.weights:
+                    self.classifier.weights[f] = defaultdict(lambda: 0)
+
+            delta = self.train_tick - self.train_last_tick[(f, label)]
+            self.train_totals[(f, label)] += delta * w
+            self.classifier.weights[f][label] += value
+            self.train_last_tick[(f, label)] = self.train_tick
+
+        self.train_tick += 1
+        for f, _ in features.items():
+            update_feature_label(truth, f, 1.0)
+            update_feature_label(pred, f, -1.0)
+
+
+    def avg_weights(self):
+        for f in self.classifier.weights:
+            for l in self.classifier.weights[f]:
+                total = self.train_totals[(f, l)]
+                delta = self.train_tick - self.train_last_tick[(f, l)]
+                total += delta * self.classifier.weights[f][l]
+                avg = round(total / float(self.train_tick))
+                if avg:
+                    self.classifier.weights[f][l] = avg
+
+    # Given a ParsedSentence, returns a new ParsedSentence with predicted dependency information.
+    # The new ParsedSentence should have the same tokens as the original and new dependencies constituting
+    # the predicted parse.
+    def parse(self, sentence):
+        state = initial_parser_state(len(sentence))
+        while not state.is_eager_finished():
+            label_indexer = get_eager_label_indexer()
+            feats = extract_feature_dict(sentence, state)
+            pred_scores = self.classifier.score(feats)
+            legal_transitions = legal(state)
+            legal_indices = []
+            for t in legal_transitions:
+                legal_indices.append(label_indexer.index_of(t))
+            decision_idx = max(legal_indices, key=lambda p:pred_scores[p])
+            decision = label_indexer.get_object(decision_idx)
+            state = state.take_eager_action(decision)
+        return ParsedSentence(sentence.tokens, state.get_eager_dep_objs(len(sentence)))
+
+
+class Classifier(object):
+    def __init__(self, weights, labels):
+        self.weights = weights
+        self.labels = labels
+
+    def score(self, features):
+        scores = [0, 0, 0, 0]
+        for feat, value in features.items():
+            if value == 0:
+                continue
+            if feat not in self.weights:
+                continue
+
+            for label, weight in self.weights[feat].items():
+                scores[label] += weight * value
+        return scores
+
+
+def train_eager_dynamic_model(parsed_sentences):
+    label_indexer = get_eager_label_indexer()
+    epochs = 10
+    model = EagerDynamicModel(Classifier({}, [0, 1, 2, 3]))
+
+    for epoch in range(0, epochs):
+        print("Epoch : %d" % (epoch+1))
+        for parsed_sentence in parsed_sentences:
+            state = initial_parser_state(len(parsed_sentence))
+
+            while not state.is_eager_finished():
+                legal_t = legal(state)
+                legal_indices = []
+                for t in legal_t:
+                    legal_indices.append(label_indexer.index_of(t))
+                zero_cost_t = zero_cost_transitions(state, parsed_sentence, legal_t)
+                zero_cost_indices = []
+                for t in zero_cost_t:
+                    zero_cost_indices.append(label_indexer.index_of(t))
+
+                features = extract_feature_dict(parsed_sentence, state)
+                pred_scores = model.classifier.score(features)
+
+                pred_t_idx = max(legal_indices, key=lambda p:pred_scores[p])
+                if len(zero_cost_t) == 0:
+                    state = state.take_eager_action(label_indexer.get_object(pred_t_idx))
+                    continue
+                zero_t_idx = max(zero_cost_indices, key=lambda p:pred_scores[p])
+
+                if pred_t_idx != zero_t_idx:
+                    model.update(pred_t_idx, zero_t_idx, features)
+
+                action_idx = choose_next_amb(epoch, pred_t_idx, zero_cost_indices)
+                state = state.take_eager_action(label_indexer.get_object(action_idx))
+
+    model.avg_weights()
+    return model
+
+
 # Returns a BeamedModel trained over the given treebank.
 def train_beamed_model(parsed_sentences):
     feature_cache = []
@@ -648,6 +761,50 @@ def extract_features(feat_indexer, sentence, parser_state, decision, add_to_inde
     add_feat(decision + ":S1S0PosWord=" + stack_two_back_tok.pos + "&" + stack_head_tok.word)
     add_feat(decision + ":S1S0B0Pos=" + stack_two_back_tok.pos + "&" + stack_head_tok.pos + "&" + buffer_first_tok.pos)
     add_feat(decision + ":S0B0B1Pos=" + stack_head_tok.pos + "&" + buffer_first_tok.pos + "&" + buffer_second_tok.pos)
+    return feats
+
+def extract_feature_dict(sentence, parser_state):
+    feats = {}
+    sos_tok = Token("<s>", "<S>", "<S>")
+    root_tok = Token("<root>", "<ROOT>", "<ROOT>")
+    eos_tok = Token("</s>", "</S>", "</S>")
+    if parser_state.stack_len() >= 1:
+        head_idx = parser_state.stack_head()
+        stack_head_tok = sentence.tokens[head_idx] if head_idx != -1 else root_tok
+        if parser_state.stack_len() >= 2:
+            two_back_idx = parser_state.stack_two_back()
+            stack_two_back_tok = sentence.tokens[two_back_idx] if two_back_idx != -1 else root_tok
+        else:
+            stack_two_back_tok = sos_tok
+    else:
+        stack_head_tok = sos_tok
+        stack_two_back_tok = sos_tok
+    buffer_first_tok = sentence.tokens[parser_state.get_buffer_word_idx(0)] if parser_state.buffer_len() >= 1 else eos_tok
+    buffer_second_tok = sentence.tokens[parser_state.get_buffer_word_idx(1)] if parser_state.buffer_len() >= 2 else eos_tok
+
+    feats[":S0Word=" + stack_head_tok.word] = 1
+    feats[":S0Pos=" + stack_head_tok.pos] = 1
+    feats[":S0CPos=" + stack_head_tok.cpos] = 1
+    feats[":S1Word=" + stack_two_back_tok.word] = 1
+    feats[":S1Pos=" + stack_two_back_tok.pos] = 1
+    feats[":S1CPos=" + stack_two_back_tok.cpos] = 1
+    feats[":B0Word=" + buffer_first_tok.word] = 1
+    feats[":B0Pos=" + buffer_first_tok.pos] = 1
+    feats[":B0CPos=" + buffer_first_tok.cpos] = 1
+    feats[":B1Word=" + buffer_second_tok.word] = 1
+    feats[":B1Pos=" + buffer_second_tok.pos] = 1
+    feats[":B1CPos=" + buffer_second_tok.cpos] = 1
+    feats[":S1S0Pos=" + stack_two_back_tok.pos + "&" + stack_head_tok.pos] = 1
+    feats[":S0B0Pos=" + stack_head_tok.pos + "&" + buffer_first_tok.pos] = 1
+    feats[":S1B0Pos=" + stack_two_back_tok.pos + "&" + buffer_first_tok.pos] = 1
+    feats[":S0B1Pos=" + stack_head_tok.pos + "&" + buffer_second_tok.pos] = 1
+    feats[":B0B1Pos=" + buffer_first_tok.pos + "&" + buffer_second_tok.pos] = 1
+    feats[":S0B0WordPos=" + stack_head_tok.word + "&" + buffer_first_tok.pos] = 1
+    feats[":S0B0PosWord=" + stack_head_tok.pos + "&" + buffer_first_tok.pos] = 1
+    feats[":S1S0WordPos=" + stack_two_back_tok.word + "&" + stack_head_tok.pos] = 1
+    feats[":S1S0PosWord=" + stack_two_back_tok.pos + "&" + stack_head_tok.word] = 1
+    feats[":S1S0B0Pos=" + stack_two_back_tok.pos + "&" + stack_head_tok.pos + "&" + buffer_first_tok.pos] = 1
+    feats[":S0B0B1Pos=" + stack_head_tok.pos + "&" + buffer_first_tok.pos + "&" + buffer_second_tok.pos] = 1
     return feats
 
 

@@ -67,7 +67,7 @@ if __name__ == '__main__':
             test_decoded = [trained_model.parse(test_ex) for test_ex in test]
             print_output(test_decoded, "test.conllx.out")
     elif system_to_run == "EAGER_DYNAMIC":
-        trained_model = train_eager_greedy_model(train, useDynamic=True)
+        trained_model = train_eager_dynamic_model(train)
         print "Parsing dev"
         parsed_dev = [trained_model.parse(sent) for sent in dev]
         if run_on_test:
