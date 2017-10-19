@@ -473,7 +473,7 @@ def train_eager_greedy_model(parsed_sentences):
         feature_cache.append(cache)
 
     # training
-    epochs = 10
+    epochs = 15
     for epoch in range(0, epochs):
         print("Epoch : %d" % (epoch+1))
         for sentence_idx in range(0, len(parsed_sentences)):
@@ -571,7 +571,7 @@ class Classifier(object):
 
 def train_eager_dynamic_model(parsed_sentences):
     label_indexer = get_eager_label_indexer()
-    epochs = 10
+    epochs = 15
     model = EagerDynamicModel(Classifier({}, [0, 1, 2, 3]))
 
     for epoch in range(0, epochs):
@@ -626,7 +626,7 @@ def train_beamed_model(parsed_sentences):
     # training
     feature_weights = np.zeros((len(feature_indexer)))
     avg_feature_weights = np.zeros((len(feature_indexer)))
-    epochs = 1
+    epochs = 15
     lr = 1
     lamb = 0.1
     beam_size = 5
@@ -759,30 +759,62 @@ def extract_feature_dict(sentence, parser_state):
         stack_two_back_tok = sos_tok
     buffer_first_tok = sentence.tokens[parser_state.get_buffer_word_idx(0)] if parser_state.buffer_len() >= 1 else eos_tok
     buffer_second_tok = sentence.tokens[parser_state.get_buffer_word_idx(1)] if parser_state.buffer_len() >= 2 else eos_tok
+    buffer_third_tok = sentence.tokens[parser_state.get_buffer_word_idx(2)] if parser_state.buffer_len() >= 3 else eos_tok
 
+    b10_token = eos_tok
+    if parser_state.buffer_len() > 0:
+        deps = parser_state.deps
+        b0_idx = parser_state.get_buffer_word_idx(0)
+        buffer_first_children = filter(lambda x: deps[x] == b0_idx, deps)
+        if len(buffer_first_children):
+            idx = min(buffer_first_children)
+            b10_token = sentence.tokens[idx]
+
+    sl0_token = eos_tok
+    sr0_token = eos_tok
+    sh0_token = eos_tok
+    if parser_state.stack_len() > 0:
+        deps = parser_state.deps
+        s0_idx = parser_state.stack_head()
+        stack_head_children = filter(lambda x: deps[x] == s0_idx, deps)
+        if len(stack_head_children):
+            sl0_token = sentence.tokens[min(stack_head_children)]
+            sr0_token = sentence.tokens[max(stack_head_children)]
+        if s0_idx in deps:
+            sh0_token = sentence.tokens[deps[s0_idx]]
+
+
+    # single word
     feats[":S0Word=" + stack_head_tok.word] = 1
     feats[":S0Pos=" + stack_head_tok.pos] = 1
-    feats[":S0CPos=" + stack_head_tok.cpos] = 1
-    feats[":S1Word=" + stack_two_back_tok.word] = 1
-    feats[":S1Pos=" + stack_two_back_tok.pos] = 1
-    feats[":S1CPos=" + stack_two_back_tok.cpos] = 1
+    feats[":S0WordPos=" + stack_head_tok.word + "&" + stack_head_tok.pos] = 1
     feats[":B0Word=" + buffer_first_tok.word] = 1
     feats[":B0Pos=" + buffer_first_tok.pos] = 1
-    feats[":B0CPos=" + buffer_first_tok.cpos] = 1
+    feats[":B0WordPos=" + buffer_first_tok.word + "&" + buffer_first_tok.pos] = 1
     feats[":B1Word=" + buffer_second_tok.word] = 1
     feats[":B1Pos=" + buffer_second_tok.pos] = 1
-    feats[":B1CPos=" + buffer_second_tok.cpos] = 1
-    feats[":S1S0Pos=" + stack_two_back_tok.pos + "&" + stack_head_tok.pos] = 1
-    feats[":S0B0Pos=" + stack_head_tok.pos + "&" + buffer_first_tok.pos] = 1
-    feats[":S1B0Pos=" + stack_two_back_tok.pos + "&" + buffer_first_tok.pos] = 1
-    feats[":S0B1Pos=" + stack_head_tok.pos + "&" + buffer_second_tok.pos] = 1
-    feats[":B0B1Pos=" + buffer_first_tok.pos + "&" + buffer_second_tok.pos] = 1
-    feats[":S0B0WordPos=" + stack_head_tok.word + "&" + buffer_first_tok.pos] = 1
-    feats[":S0B0PosWord=" + stack_head_tok.pos + "&" + buffer_first_tok.pos] = 1
-    feats[":S1S0WordPos=" + stack_two_back_tok.word + "&" + stack_head_tok.pos] = 1
-    feats[":S1S0PosWord=" + stack_two_back_tok.pos + "&" + stack_head_tok.word] = 1
-    feats[":S1S0B0Pos=" + stack_two_back_tok.pos + "&" + stack_head_tok.pos + "&" + buffer_first_tok.pos] = 1
-    feats[":S0B0B1Pos=" + stack_head_tok.pos + "&" + buffer_first_tok.pos + "&" + buffer_second_tok.pos] = 1
+    feats[":B1WordPos=" + buffer_second_tok.word + "&" + buffer_second_tok.pos] = 1
+    feats[":B2Word=" + buffer_third_tok.word] = 1
+    feats[":B2Pos=" + buffer_third_tok.pos] = 1
+    feats[":B2WordPos=" + buffer_third_tok.word + "&" + buffer_third_tok.pos] = 1
+
+    # two words
+    feats[":S0WP_B0WP=" + stack_head_tok.word + "&" + stack_head_tok.pos + ";" + buffer_first_tok.word + "&" + buffer_first_tok.pos] = 1
+    feats[":S0WP_B0W=" + stack_head_tok.word + "&" + stack_head_tok.pos + ";" + buffer_first_tok.word] = 1
+    feats[":S0W_B0WP=" + stack_head_tok.word + ";" + buffer_first_tok.word + "&" + buffer_first_tok.pos] = 1
+    feats[":S0WP_B0P=" + stack_head_tok.word + "&" + stack_head_tok.pos + ";" + buffer_first_tok.pos] = 1
+    feats[":S0P_B0WP=" + stack_head_tok.pos + ";" + buffer_first_tok.word + "&" + buffer_first_tok.pos] = 1
+    feats[":S0W_B0W=" + stack_head_tok.word + ";" + buffer_first_tok.word] = 1
+    feats[":S0P_B0P=" + stack_head_tok.pos + ";" + buffer_first_tok.pos] = 1
+    feats[":B0P_B1P=" + buffer_first_tok.pos + ";" + buffer_second_tok.pos] = 1
+
+    # three words
+    feats[":B0P_B1P_B2P=" + buffer_first_tok.pos + ";" + buffer_second_tok.pos + ";" + buffer_third_tok.pos] = 1
+    feats[":S0P_B0P_B1P=" + stack_head_tok.pos + ";" + buffer_first_tok.pos + ";" + buffer_second_tok.pos] = 1
+    feats[":Sh0P_S0P_B0P=" + sh0_token.pos + ";" + stack_head_tok.pos + ";" + buffer_first_tok.pos] = 1
+    feats[":S0P_Sl0P_B0P=" + stack_head_tok.pos + ";" + sl0_token.pos + ";" + buffer_first_tok.pos] = 1
+    feats[":S0P_Sr0P_B0P=" + stack_head_tok.pos + ";" + sr0_token.pos + ";" + buffer_first_tok.pos] = 1
+    feats[":S0P_B0P_B10P=" + stack_head_tok.pos + ";" + buffer_first_tok.pos + ";" + b10_token.pos] = 1
     return feats
 
 
