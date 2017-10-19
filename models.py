@@ -294,11 +294,13 @@ def train_greedy_model(parsed_sentences):
         feature_cache.append(cache)
 
     # training
-    feature_weights = np.random.rand((len(feature_indexer)))
-    model = GreedyModel(feature_indexer, feature_weights)
+    feature_weights = np.zeros((len(feature_indexer)))
+    avg_feature_weights = np.zeros((len(feature_indexer)))
     epochs = 15
-    lr = 0.01
+    lr = 1
     lamb = 0.1
+    step = epochs * len(parsed_sentences)
+    total_iters = step
     for epoch in range(0, epochs):
         print("Epoch : %d" % (epoch+1))
         # gradient = Counter() 
@@ -309,9 +311,7 @@ def train_greedy_model(parsed_sentences):
                 max_idx = -1
                 slack = -1
                 for label_idx in range(0, len(label_indexer)):
-                    tmp = score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], model.feature_weights)
-                    if label_idx != gold_label_idx:
-                        tmp += 1
+                    tmp = score_indexed_features(feature_cache[sentence_idx][seq_idx][label_idx], feature_weights)
                     if tmp > slack:
                         max_idx = label_idx
                         slack = tmp
@@ -321,9 +321,12 @@ def train_greedy_model(parsed_sentences):
                 gradient.increment_all(feature_cache[sentence_idx][seq_idx][gold_label_idx], -1.0)
 
                 for weight_idx in gradient.keys():
-                    model.feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx)) 
+                    feature_weights[weight_idx] -= (lr * gradient.get_count(weight_idx)) 
+                    avg_feature_weights[weight_idx] -= (step * lr * gradient.get_count(weight_idx))/total_iters
                 gradient = Counter()
+            step -= 1
 
+    model = GreedyModel(feature_indexer, avg_feature_weights)
     return model
 
 def zero_cost_left(state, parsed_sentence):
